@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Resource Usage Tray
+Comment=Show CPU, memory, and GPU usage in the system tray
+Exec=@BIN_DIR@/resource-usage-tray
+Terminal=false
+StartupNotify=false
+OnlyShowIn=GNOME;Ubuntu;
+X-GNOME-Autostart-enabled=true

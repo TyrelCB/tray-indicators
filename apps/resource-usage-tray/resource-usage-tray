@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+
+import fcntl
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import psutil
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+
+from gi.repository import AyatanaAppIndicator3, GLib, Gtk
+
+GUIDE_LABEL = "CPU 100% | MEM 100% : 999.9GB | GPU 100%"
+BYTES_PER_GB = 1000 ** 3
+GPU_COMMAND = [
+    "nvidia-smi",
+    "--query-gpu=utilization.gpu",
+    "--format=csv,noheader,nounits",
+]
+
+
+class ResourceUsageTray:
+    def __init__(self):
+        self._lock_file = None
+        self._gpu_supported = shutil.which("nvidia-smi") is not None
+        self._last_gpu_percent = None
+
+        self._acquire_lock()
+        psutil.cpu_percent(interval=0.1)
+
+        self._indicator = AyatanaAppIndicator3.Indicator.new(
+            "resource-usage-tray",
+            "utilities-system-monitor-symbolic",
+            AyatanaAppIndicator3.IndicatorCategory.SYSTEM_SERVICES,
+        )
+        self._indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
+        self._indicator.set_menu(self._build_menu())
+
+        self._update_label()
+        GLib.timeout_add_seconds(1, self._update_label)
+
+    def _acquire_lock(self):
+        lock_path = Path.home() / ".cache" / "resource-usage-tray.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock_file = lock_path.open("w")
+
+        try:
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit(0)
+
+    def _build_menu(self):
+        menu = Gtk.Menu()
+
+        open_item = Gtk.MenuItem(label="Open System Monitor")
+        open_item.connect("activate", self._open_system_monitor)
+        menu.append(open_item)
+
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", self._quit)
+        menu.append(quit_item)
+
+        menu.show_all()
+        return menu
+
+    def _open_system_monitor(self, *_args):
+        subprocess.Popen(
+            ["gnome-system-monitor"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    def _quit(self, *_args):
+        Gtk.main_quit()
+
+    def _read_gpu_percent(self):
+        if not self._gpu_supported:
+            return None
+
+        try:
+            result = subprocess.run(
+                GPU_COMMAND,
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=0.8,
+            )
+        except FileNotFoundError:
+            self._gpu_supported = False
+            return None
+        except subprocess.TimeoutExpired:
+            return self._last_gpu_percent
+
+        if result.returncode != 0:
+            return self._last_gpu_percent
+
+        values = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                values.append(float(line))
+            except ValueError:
+                continue
+
+        if not values:
+            return self._last_gpu_percent
+
+        self._last_gpu_percent = round(sum(values) / len(values))
+        return self._last_gpu_percent
+
+    def _format_label(self):
+        cpu_percent = round(psutil.cpu_percent(interval=None))
+
+        memory = psutil.virtual_memory()
+        used_bytes = memory.total - memory.available
+        memory_percent = round((used_bytes / memory.total) * 100) if memory.total else 0
+        memory_used_gb = used_bytes / BYTES_PER_GB
+
+        gpu_percent = self._read_gpu_percent()
+        if gpu_percent is None:
+            gpu_text = "n/a" if not self._gpu_supported else "--%"
+        else:
+            gpu_text = f"{gpu_percent}%"
+
+        return (
+            f"CPU {cpu_percent}% | MEM {memory_percent}% : "
+            f"{memory_used_gb:.1f}GB | GPU {gpu_text}"
+        )
+
+    def _update_label(self):
+        self._indicator.set_label(self._format_label(), GUIDE_LABEL)
+        return True
+
+
+def main():
+    ResourceUsageTray()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,730 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import base64
+import configparser
+import hashlib
+import json
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import gi
+import websocket
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+gi.require_version("Notify", "0.7")
+
+from gi.repository import AyatanaAppIndicator3, GLib, Gtk, Notify
+
+APP_ID = "obs-tray-indicator"
+OBS_CONFIG_PATH = Path.home() / ".config/obs-studio/global.ini"
+ICON_THEME_PATH = Path.home() / ".local/share/obs-tray-indicator/icons"
+EVENT_SUBSCRIPTIONS = 2047
+SOCKET_TIMEOUT_SECONDS = 0.5
+RECONNECT_DELAY_SECONDS = 2
+LABEL_GUIDE = "IDLE | MMMMMMMMMMMMMMMMMMMMMMMMMMMM"
+MAX_SCENE_LABEL_LENGTH = 28
+
+
+class ObsProtocolError(RuntimeError):
+    pass
+
+
+class ObsAuthError(RuntimeError):
+    pass
+
+
+@dataclass
+class ObsSettings:
+    enabled: bool
+    port: int
+    auth_required: bool
+    password: str
+
+
+@dataclass
+class ObsSnapshot:
+    state: str
+    scene_name: str
+    detail: str
+    label: str
+    icon_name: str
+
+
+@dataclass
+class ObsProcessInfo:
+    pid: int
+    started_at: float
+
+
+def _collapse_spaces(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _truncate_scene_name(value: str, max_length: int = MAX_SCENE_LABEL_LENGTH) -> str:
+    normalized = _collapse_spaces(value).strip() or "-"
+    if len(normalized) <= max_length:
+        return normalized
+    return normalized[: max_length - 3].rstrip() + "..."
+
+
+def _read_obs_settings(path: Path = OBS_CONFIG_PATH) -> ObsSettings:
+    parser = configparser.ConfigParser()
+    parser.optionxform = str
+    parser.read(path)
+
+    if not parser.has_section("OBSWebSocket"):
+        return ObsSettings(enabled=False, port=4455, auth_required=False, password="")
+
+    section = parser["OBSWebSocket"]
+    return ObsSettings(
+        enabled=section.getboolean("ServerEnabled", fallback=False),
+        port=section.getint("ServerPort", fallback=4455),
+        auth_required=section.getboolean("AuthRequired", fallback=False),
+        password=section.get("ServerPassword", fallback=""),
+    )
+
+
+def _get_obs_process_info() -> ObsProcessInfo | None:
+    result = subprocess.run(
+        ["ps", "-o", "pid=,lstart=", "-C", "obs"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        pid_text, started_text = line.split(None, 1)
+        try:
+            started_at = datetime.strptime(started_text, "%a %b %d %H:%M:%S %Y").timestamp()
+            return ObsProcessInfo(pid=int(pid_text), started_at=started_at)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _hash_base64(value: str) -> str:
+    digest = hashlib.sha256(value.encode("utf-8")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def _build_auth_response(password: str, salt: str, challenge: str) -> str:
+    secret = _hash_base64(password + salt)
+    return _hash_base64(secret + challenge)
+
+
+def _identify_connection(
+    ws: websocket.WebSocket,
+    settings: ObsSettings,
+    *,
+    event_subscriptions: int = 0,
+) -> None:
+    hello = _recv_json(ws)
+    if hello.get("op") != 0:
+        raise ObsProtocolError("OBS websocket did not send the expected Hello message")
+
+    hello_data = hello.get("d", {})
+    if not isinstance(hello_data, dict):
+        raise ObsProtocolError("OBS websocket Hello payload was malformed")
+
+    identify_payload: dict[str, Any] = {
+        "rpcVersion": hello_data.get("rpcVersion", 1),
+        "eventSubscriptions": event_subscriptions,
+    }
+
+    auth_info = hello_data.get("authentication")
+    if isinstance(auth_info, dict):
+        if not settings.password:
+            raise ObsAuthError("OBS websocket requires a password, but none was found in global.ini")
+        identify_payload["authentication"] = _build_auth_response(
+            settings.password,
+            str(auth_info["salt"]),
+            str(auth_info["challenge"]),
+        )
+    elif settings.auth_required:
+        raise ObsAuthError("OBS websocket auth is required but the server did not provide a challenge")
+
+    ws.send(json.dumps({"op": 1, "d": identify_payload}))
+    identified = _recv_json(ws)
+    if identified.get("op") != 2:
+        raise ObsProtocolError("OBS websocket did not accept the session identify request")
+
+
+def _open_obs_connection(
+    settings: ObsSettings,
+    *,
+    event_subscriptions: int = 0,
+) -> websocket.WebSocket:
+    ws = websocket.create_connection(
+        f"ws://127.0.0.1:{settings.port}",
+        timeout=SOCKET_TIMEOUT_SECONDS,
+    )
+    _identify_connection(ws, settings, event_subscriptions=event_subscriptions)
+    ws.settimeout(SOCKET_TIMEOUT_SECONDS)
+    return ws
+
+
+def _recv_json(ws: websocket.WebSocket) -> dict[str, Any]:
+    payload = ws.recv()
+    if not isinstance(payload, str):
+        raise ObsProtocolError("Received a non-text websocket payload from OBS")
+    data = json.loads(payload)
+    if not isinstance(data, dict):
+        raise ObsProtocolError("Received a malformed websocket message from OBS")
+    return data
+
+
+def _send_request_message(
+    ws: websocket.WebSocket,
+    request_type: str,
+    *,
+    request_id: str | None = None,
+) -> str:
+    if request_id is None:
+        request_id = f"{request_type}-{time.time_ns()}"
+    ws.send(
+        json.dumps(
+            {
+                "op": 6,
+                "d": {
+                    "requestType": request_type,
+                    "requestId": request_id,
+                },
+            }
+        )
+    )
+    return request_id
+
+
+def _send_request(ws: websocket.WebSocket, request_type: str) -> dict[str, Any]:
+    request_id = _send_request_message(ws, request_type)
+
+    while True:
+        message = _recv_json(ws)
+        if message.get("op") != 7:
+            continue
+
+        data = message.get("d", {})
+        if data.get("requestId") != request_id:
+            continue
+
+        status = data.get("requestStatus", {})
+        if not status.get("result"):
+            code = status.get("code", "?")
+            comment = status.get("comment") or "OBS rejected the request"
+            raise ObsProtocolError(f"{request_type} failed ({code}): {comment}")
+
+        response = data.get("responseData", {})
+        if not isinstance(response, dict):
+            raise ObsProtocolError(f"{request_type} returned malformed response data")
+        return response
+
+
+def _is_output_active(payload: dict[str, Any]) -> bool:
+    if "outputActive" in payload:
+        return bool(payload["outputActive"])
+
+    output_state = str(payload.get("outputState") or "")
+    return output_state in {
+        "OBS_WEBSOCKET_OUTPUT_STARTING",
+        "OBS_WEBSOCKET_OUTPUT_STARTED",
+        "OBS_WEBSOCKET_OUTPUT_PAUSING",
+        "OBS_WEBSOCKET_OUTPUT_PAUSED",
+        "OBS_WEBSOCKET_OUTPUT_RESUMING",
+    }
+
+
+def _build_live_snapshot(scene_name: str, is_recording: bool) -> ObsSnapshot:
+    return _build_snapshot(
+        "recording" if is_recording else "idle",
+        scene_name,
+        "Connected to OBS websocket.",
+    )
+
+
+def _needs_scene_sync(event_type: str) -> bool:
+    if event_type == "CurrentProgramSceneChanged":
+        return False
+    return "Scene" in event_type or "Transition" in event_type
+
+
+def _build_snapshot(state: str, scene_name: str, detail: str) -> ObsSnapshot:
+    display_scene = _truncate_scene_name(scene_name)
+    if state == "recording":
+        return ObsSnapshot(
+            state=state,
+            scene_name=scene_name,
+            detail=detail,
+            label=f"REC | {display_scene}",
+            icon_name="obs-tray-recording",
+        )
+    if state == "idle":
+        return ObsSnapshot(
+            state=state,
+            scene_name=scene_name,
+            detail=detail,
+            label=f"IDLE | {display_scene}",
+            icon_name="obs-tray-idle",
+        )
+    if state == "disabled":
+        return ObsSnapshot(
+            state=state,
+            scene_name=scene_name,
+            detail=detail,
+            label="WS OFF | Enable in OBS",
+            icon_name="obs-tray-offline",
+        )
+    if state == "auth-error":
+        return ObsSnapshot(
+            state=state,
+            scene_name=scene_name,
+            detail=detail,
+            label="AUTH ERR | Check OBS",
+            icon_name="obs-tray-offline",
+        )
+    if state == "restart-needed":
+        return ObsSnapshot(
+            state=state,
+            scene_name=scene_name,
+            detail=detail,
+            label="RESTART OBS",
+            icon_name="obs-tray-offline",
+        )
+    if state == "not-running":
+        return ObsSnapshot(
+            state=state,
+            scene_name=scene_name,
+            detail=detail,
+            label="OBS OFF | Start OBS",
+            icon_name="obs-tray-offline",
+        )
+    if state == "ws-not-listening":
+        return ObsSnapshot(
+            state=state,
+            scene_name=scene_name,
+            detail=detail,
+            label="WS OFF | Check OBS",
+            icon_name="obs-tray-offline",
+        )
+    return ObsSnapshot(
+        state=state,
+        scene_name=scene_name,
+        detail=detail,
+        label="OBS OFFLINE",
+        icon_name="obs-tray-offline",
+    )
+
+
+def _build_unavailable_snapshot(settings: ObsSettings) -> ObsSnapshot:
+    obs_process = _get_obs_process_info()
+    if obs_process is None:
+        return _build_snapshot("not-running", "-", "OBS is not running.")
+
+    try:
+        config_mtime = OBS_CONFIG_PATH.stat().st_mtime
+    except OSError:
+        config_mtime = None
+
+    if config_mtime and config_mtime > obs_process.started_at:
+        return _build_snapshot(
+            "restart-needed",
+            "-",
+            "OBS is still using its old startup settings. Restart OBS once so the websocket server starts.",
+        )
+
+    return _build_snapshot(
+        "ws-not-listening",
+        "-",
+        f"OBS is running, but websocket is not listening on port {settings.port}. Check OBS WebSocket Server Settings.",
+    )
+
+
+def _fetch_obs_snapshot(settings: ObsSettings) -> ObsSnapshot:
+    if not settings.enabled:
+        return _build_snapshot(
+            "disabled",
+            "-",
+            f"OBS websocket is disabled in {OBS_CONFIG_PATH}.",
+        )
+
+    ws: websocket.WebSocket | None = None
+    try:
+        ws = _open_obs_connection(settings)
+        record_status = _send_request(ws, "GetRecordStatus")
+        scene_status = _send_request(ws, "GetCurrentProgramScene")
+
+        is_recording = _is_output_active(record_status)
+        scene_name = str(scene_status.get("currentProgramSceneName") or "-")
+        return _build_live_snapshot(scene_name, is_recording)
+    except ObsAuthError as exc:
+        return _build_snapshot("auth-error", "-", str(exc))
+    except OSError as exc:
+        if exc.errno == 111:
+            return _build_unavailable_snapshot(settings)
+        return _build_snapshot("offline", "-", f"Unable to query OBS websocket on port {settings.port}: {exc}")
+    except (
+        websocket.WebSocketException,
+        json.JSONDecodeError,
+        ObsProtocolError,
+    ) as exc:
+        return _build_snapshot("offline", "-", f"Unable to query OBS websocket on port {settings.port}: {exc}")
+    finally:
+        if ws is not None:
+            ws.close()
+
+
+class ObsTrayIndicator:
+    def __init__(self) -> None:
+        Notify.init(APP_ID)
+
+        self.indicator = AyatanaAppIndicator3.Indicator.new(
+            APP_ID,
+            "obs-tray-offline",
+            AyatanaAppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+        )
+        self.indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
+        self.indicator.set_icon_theme_path(str(ICON_THEME_PATH))
+        self.indicator.set_title("OBS Status")
+        self.indicator.set_menu(self._build_menu())
+        self.indicator.set_label("Starting...", LABEL_GUIDE)
+
+        self.last_state: str | None = None
+        self.last_scene_name: str | None = None
+        initial_snapshot = _fetch_obs_snapshot(_read_obs_settings())
+        self._apply_snapshot(initial_snapshot)
+        self.command_queue: queue.Queue[str] = queue.Queue()
+        self.stop_event = threading.Event()
+        self.worker = threading.Thread(target=self._run_connection_loop, name="obs-tray-worker", daemon=True)
+        self.worker.start()
+
+    def _build_menu(self) -> Gtk.Menu:
+        menu = Gtk.Menu()
+
+        self.status_item = Gtk.MenuItem(label="Status: Starting...")
+        self.status_item.set_sensitive(False)
+        menu.append(self.status_item)
+
+        self.scene_item = Gtk.MenuItem(label="Scene: -")
+        self.scene_item.set_sensitive(False)
+        menu.append(self.scene_item)
+
+        self.detail_item = Gtk.MenuItem(label="Waiting for OBS...")
+        self.detail_item.set_sensitive(False)
+        menu.append(self.detail_item)
+
+        self.last_update_item = Gtk.MenuItem(label="Last update: --")
+        self.last_update_item.set_sensitive(False)
+        menu.append(self.last_update_item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        refresh_item = Gtk.MenuItem(label="Refresh now")
+        refresh_item.connect("activate", self._on_refresh_clicked)
+        menu.append(refresh_item)
+
+        if shutil.which("obs"):
+            open_obs_item = Gtk.MenuItem(label="Open OBS")
+            open_obs_item.connect("activate", self._on_open_obs_clicked)
+            menu.append(open_obs_item)
+
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", self._on_quit_clicked)
+        menu.append(quit_item)
+
+        menu.show_all()
+        return menu
+
+    def _schedule_snapshot(self, snapshot: ObsSnapshot) -> None:
+        GLib.idle_add(self._apply_snapshot, snapshot)
+
+    def _resolve_scene_name(self, scene_name: str, state: str) -> str:
+        if scene_name != "-":
+            return scene_name
+        if state in {"recording", "idle"} and self.last_scene_name and self.last_scene_name != "-":
+            return self.last_scene_name
+        return scene_name
+
+    def _apply_snapshot(self, snapshot: ObsSnapshot) -> None:
+        scene_name = self._resolve_scene_name(snapshot.scene_name, snapshot.state)
+        if scene_name != snapshot.scene_name and snapshot.state in {"recording", "idle"}:
+            snapshot = ObsSnapshot(
+                state=snapshot.state,
+                scene_name=scene_name,
+                detail=snapshot.detail,
+                label=_build_live_snapshot(scene_name, snapshot.state == "recording").label,
+                icon_name=snapshot.icon_name,
+            )
+
+        self.indicator.set_icon_full(snapshot.icon_name, snapshot.detail)
+        self.indicator.set_label(snapshot.label, LABEL_GUIDE)
+
+        if snapshot.state == "recording":
+            status_text = "Status: Recording"
+        elif snapshot.state == "idle":
+            status_text = "Status: Not recording"
+        elif snapshot.state == "disabled":
+            status_text = "Status: Websocket disabled"
+        elif snapshot.state == "auth-error":
+            status_text = "Status: Authentication failed"
+        elif snapshot.state == "restart-needed":
+            status_text = "Status: Restart OBS"
+        elif snapshot.state == "not-running":
+            status_text = "Status: OBS not running"
+        elif snapshot.state == "ws-not-listening":
+            status_text = "Status: Websocket not listening"
+        else:
+            status_text = "Status: OBS unavailable"
+
+        self.status_item.set_label(status_text)
+        self.scene_item.set_label(f"Scene: {snapshot.scene_name}")
+        self.detail_item.set_label(snapshot.detail)
+        self.last_update_item.set_label(f"Last update: {time.strftime('%H:%M:%S')}")
+
+        self.last_state = snapshot.state
+        if snapshot.scene_name != "-":
+            self.last_scene_name = snapshot.scene_name
+
+    def _request_live_snapshot(
+        self,
+        ws: websocket.WebSocket,
+        pending_requests: dict[str, str],
+    ) -> None:
+        for request_type in ("GetRecordStatus", "GetCurrentProgramScene"):
+            request_id = _send_request_message(ws, request_type)
+            pending_requests[request_id] = request_type
+
+    def _handle_event_message(
+        self,
+        event: dict[str, Any],
+        live_state: dict[str, Any],
+        ws: websocket.WebSocket,
+        pending_requests: dict[str, str],
+    ) -> None:
+        event_type = str(event.get("eventType") or "")
+        event_data = event.get("eventData", {})
+        if not isinstance(event_data, dict):
+            return
+
+        should_schedule_snapshot = False
+
+        if event_type == "CurrentProgramSceneChanged":
+            live_state["scene_name"] = str(event_data.get("currentProgramSceneName") or "-")
+            should_schedule_snapshot = True
+        elif event_type == "RecordStateChanged":
+            live_state["is_recording"] = _is_output_active(event_data)
+            if (
+                str(live_state["scene_name"]) == "-"
+                and self.last_scene_name
+                and self.last_scene_name != "-"
+            ):
+                live_state["scene_name"] = self.last_scene_name
+            if str(live_state["scene_name"]) == "-":
+                request_id = _send_request_message(ws, "GetCurrentProgramScene")
+                pending_requests[request_id] = "GetCurrentProgramScene"
+            should_schedule_snapshot = True
+
+        if _needs_scene_sync(event_type):
+            self._request_live_snapshot(ws, pending_requests)
+
+        if should_schedule_snapshot:
+            self._schedule_snapshot(
+                _build_live_snapshot(
+                    str(live_state["scene_name"]),
+                    bool(live_state["is_recording"]),
+                )
+            )
+
+    def _handle_request_response(
+        self,
+        response_message: dict[str, Any],
+        pending_requests: dict[str, str],
+        live_state: dict[str, Any],
+        ws: websocket.WebSocket,
+    ) -> None:
+        request_id = str(response_message.get("requestId") or "")
+        request_type = pending_requests.pop(request_id, None)
+        if request_type is None:
+            return
+
+        status = response_message.get("requestStatus", {})
+        if not isinstance(status, dict):
+            raise ObsProtocolError(f"{request_type} returned malformed status metadata")
+
+        if not status.get("result"):
+            code = status.get("code", "?")
+            comment = status.get("comment") or "OBS rejected the request"
+            if code == 207:
+                time.sleep(0.5)
+                self._request_live_snapshot(ws, pending_requests)
+                return
+            raise ObsProtocolError(f"{request_type} failed ({code}): {comment}")
+
+        response_data = response_message.get("responseData", {})
+        if not isinstance(response_data, dict):
+            raise ObsProtocolError(f"{request_type} returned malformed response data")
+
+        if request_type == "GetRecordStatus":
+            live_state["is_recording"] = _is_output_active(response_data)
+        elif request_type == "GetCurrentProgramScene":
+            live_state["scene_name"] = str(response_data.get("currentProgramSceneName") or "-")
+
+        if (
+            str(live_state["scene_name"]) == "-"
+            and self.last_scene_name
+            and self.last_scene_name != "-"
+        ):
+            live_state["scene_name"] = self.last_scene_name
+
+        self._schedule_snapshot(
+            _build_live_snapshot(
+                str(live_state["scene_name"]),
+                bool(live_state["is_recording"]),
+            )
+        )
+
+    def _drain_commands(
+        self,
+        ws: websocket.WebSocket,
+        pending_requests: dict[str, str],
+    ) -> None:
+        while True:
+            try:
+                command = self.command_queue.get_nowait()
+            except queue.Empty:
+                return
+
+            if command == "refresh":
+                self._request_live_snapshot(ws, pending_requests)
+            elif command == "stop":
+                self.stop_event.set()
+                return
+
+    def _run_connection_loop(self) -> None:
+        while not self.stop_event.is_set():
+            settings = _read_obs_settings()
+            if not settings.enabled:
+                self._schedule_snapshot(
+                    _build_snapshot(
+                        "disabled",
+                        "-",
+                        f"OBS websocket is disabled in {OBS_CONFIG_PATH}.",
+                    )
+                )
+                if self.stop_event.wait(RECONNECT_DELAY_SECONDS):
+                    return
+                continue
+
+            ws: websocket.WebSocket | None = None
+            pending_requests: dict[str, str] = {}
+            live_state: dict[str, Any] = {
+                "scene_name": self.last_scene_name or "-",
+                "is_recording": self.last_state == "recording",
+            }
+
+            try:
+                ws = _open_obs_connection(
+                    settings,
+                    event_subscriptions=EVENT_SUBSCRIPTIONS,
+                )
+                self._request_live_snapshot(ws, pending_requests)
+
+                while not self.stop_event.is_set():
+                    self._drain_commands(ws, pending_requests)
+                    try:
+                        message = _recv_json(ws)
+                    except websocket.WebSocketTimeoutException:
+                        continue
+
+                    op = message.get("op")
+                    data = message.get("d", {})
+                    if not isinstance(data, dict):
+                        continue
+
+                    if op == 5:
+                        self._handle_event_message(data, live_state, ws, pending_requests)
+                    elif op == 7:
+                        self._handle_request_response(data, pending_requests, live_state, ws)
+            except ObsAuthError as exc:
+                self._schedule_snapshot(_build_snapshot("auth-error", "-", str(exc)))
+            except OSError as exc:
+                if exc.errno == 111:
+                    self._schedule_snapshot(_build_unavailable_snapshot(settings))
+                else:
+                    self._schedule_snapshot(
+                        _build_snapshot(
+                            "offline",
+                            "-",
+                            f"Unable to query OBS websocket on port {settings.port}: {exc}",
+                        )
+                    )
+            except (
+                websocket.WebSocketException,
+                json.JSONDecodeError,
+                ObsProtocolError,
+            ) as exc:
+                self._schedule_snapshot(
+                    _build_snapshot(
+                        "offline",
+                        "-",
+                        f"Unable to query OBS websocket on port {settings.port}: {exc}",
+                    )
+                )
+            finally:
+                if ws is not None:
+                    ws.close()
+
+            if self.stop_event.wait(RECONNECT_DELAY_SECONDS):
+                return
+
+    def _on_refresh_clicked(self, _item: Gtk.MenuItem) -> None:
+        self.command_queue.put("refresh")
+
+    def _on_open_obs_clicked(self, _item: Gtk.MenuItem) -> None:
+        subprocess.Popen(["obs"])
+
+    def _on_quit_clicked(self, _item: Gtk.MenuItem) -> None:
+        self.stop_event.set()
+        self.command_queue.put("stop")
+        self.worker.join(timeout=1)
+        Gtk.main_quit()
+
+
+def _run_once() -> int:
+    settings = _read_obs_settings()
+    snapshot = _fetch_obs_snapshot(settings)
+    print(snapshot.label)
+    print(snapshot.detail)
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="OBS system tray indicator")
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Query OBS once and print the current status instead of starting the tray app.",
+    )
+    args = parser.parse_args()
+
+    if args.once:
+        return _run_once()
+
+    ObsTrayIndicator()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
