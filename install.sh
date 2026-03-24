@@ -98,10 +98,9 @@ install_python_deps() {
 install_files() {
     local bin_dir="${HOME}/.local/bin"
     local share_dir="${HOME}/.local/share/obs-tray-indicator/icons"
-    local autostart_dir="${HOME}/.config/autostart"
     local systemd_user_dir="${HOME}/.config/systemd/user"
 
-    mkdir -p "${bin_dir}" "${share_dir}" "${autostart_dir}" "${systemd_user_dir}"
+    mkdir -p "${bin_dir}" "${share_dir}" "${systemd_user_dir}"
 
     install -m 755 \
         "${SOURCE_ROOT}/apps/resource-usage-tray/resource-usage-tray" \
@@ -115,10 +114,11 @@ install_files() {
     install -m 644 \
         "${SOURCE_ROOT}/apps/obs-tray-indicator/obs-tray-indicator.service" \
         "${systemd_user_dir}/obs-tray-indicator.service"
+    install -m 644 \
+        "${SOURCE_ROOT}/apps/resource-usage-tray/resource-usage-tray.service" \
+        "${systemd_user_dir}/resource-usage-tray.service"
 
-    sed "s|@BIN_DIR@|${bin_dir}|g" \
-        "${SOURCE_ROOT}/apps/resource-usage-tray/resource-usage-tray.desktop.in" \
-        > "${autostart_dir}/resource-usage-tray.desktop"
+    rm -f "${HOME}/.config/autostart/resource-usage-tray.desktop"
 }
 
 start_services() {
@@ -130,17 +130,7 @@ start_services() {
     systemctl --user daemon-reload || true
     systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP || true
     systemctl --user enable --now obs-tray-indicator.service || true
-
-    if command -v systemd-run >/dev/null 2>&1; then
-        systemd-run --user --unit=resource-usage-tray --collect \
-            --setenv=DISPLAY="${DISPLAY:-}" \
-            --setenv=WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
-            --setenv=XAUTHORITY="${XAUTHORITY:-}" \
-            --setenv=DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
-            --setenv=XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
-            --setenv=XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-}" \
-            "${HOME}/.local/bin/resource-usage-tray" >/dev/null 2>&1 || true
-    fi
+    systemctl --user enable --now resource-usage-tray.service || true
 }
 
 print_success() {
