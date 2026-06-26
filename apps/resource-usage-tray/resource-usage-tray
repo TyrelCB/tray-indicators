@@ -4,6 +4,7 @@ import fcntl
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import psutil
@@ -13,15 +14,35 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 
-from gi.repository import AyatanaAppIndicator3, GLib, Gtk
+from gi.repository import AyatanaAppIndicator3, Gio, GLib, Gtk
 
-GUIDE_LABEL = "CPU 100% | MEM 100% : 999.9GB | GPU 100%"
-BYTES_PER_GB = 1000 ** 3
+GUIDE_LABEL = "\U0001F534 CPU 100% | \U0001F534 MEM 100% : 999.9GiB | \U0001F534 GPU 100%"
+BYTES_PER_GIB = 1024 ** 3
 GPU_COMMAND = [
     "nvidia-smi",
     "--query-gpu=utilization.gpu",
     "--format=csv,noheader,nounits",
 ]
+WATCHER_SERVICE = "org.kde.StatusNotifierWatcher"
+WATCHER_PATH = "/StatusNotifierWatcher"
+WATCHER_INTERFACE = "org.kde.StatusNotifierWatcher"
+
+DOT_WHITE = "⚪"
+DOT_GREEN = "\U0001F7E2"
+DOT_ORANGE = "\U0001F7E0"
+DOT_RED = "\U0001F534"
+
+
+def dot_for_percent(percent):
+    if percent is None:
+        return DOT_WHITE
+    if percent < 25:
+        return DOT_WHITE
+    if percent < 60:
+        return DOT_GREEN
+    if percent < 85:
+        return DOT_ORANGE
+    return DOT_RED
 
 
 class ResourceUsageTray:
@@ -32,6 +53,7 @@ class ResourceUsageTray:
 
         self._acquire_lock()
         psutil.cpu_percent(interval=0.1)
+        self._wait_for_status_notifier_host()
 
         self._indicator = AyatanaAppIndicator3.Indicator.new(
             "resource-usage-tray",
@@ -79,6 +101,34 @@ class ResourceUsageTray:
     def _quit(self, *_args):
         Gtk.main_quit()
 
+    def _wait_for_status_notifier_host(self, timeout_seconds=15, poll_interval_seconds=0.5):
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        except Exception:
+            return
+
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                result = bus.call_sync(
+                    WATCHER_SERVICE,
+                    WATCHER_PATH,
+                    "org.freedesktop.DBus.Properties",
+                    "Get",
+                    GLib.Variant("(ss)", (WATCHER_INTERFACE, "IsStatusNotifierHostRegistered")),
+                    GLib.VariantType.new("(v)"),
+                    Gio.DBusCallFlags.NONE,
+                    int(poll_interval_seconds * 1000),
+                    None,
+                )
+                host_registered = result.unpack()[0].unpack()
+                if host_registered:
+                    return
+            except Exception:
+                pass
+
+            time.sleep(poll_interval_seconds)
+
     def _read_gpu_percent(self):
         if not self._gpu_supported:
             return None
@@ -123,7 +173,7 @@ class ResourceUsageTray:
         memory = psutil.virtual_memory()
         used_bytes = memory.total - memory.available
         memory_percent = round((used_bytes / memory.total) * 100) if memory.total else 0
-        memory_used_gb = used_bytes / BYTES_PER_GB
+        memory_used_gib = used_bytes / BYTES_PER_GIB
 
         gpu_percent = self._read_gpu_percent()
         if gpu_percent is None:
@@ -131,9 +181,14 @@ class ResourceUsageTray:
         else:
             gpu_text = f"{gpu_percent}%"
 
+        cpu_dot = dot_for_percent(cpu_percent)
+        mem_dot = dot_for_percent(memory_percent)
+        gpu_dot = dot_for_percent(gpu_percent)
+
         return (
-            f"CPU {cpu_percent}% | MEM {memory_percent}% : "
-            f"{memory_used_gb:.1f}GB | GPU {gpu_text}"
+            f"{cpu_dot} CPU {cpu_percent}% | "
+            f"{mem_dot} MEM {memory_percent}% : {memory_used_gib:.1f}GiB | "
+            f"{gpu_dot} GPU {gpu_text}"
         )
 
     def _update_label(self):
